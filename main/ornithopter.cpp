@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <iostream>
 #include <cstring>
+#include <tuple>
 #include <inttypes.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -21,7 +22,7 @@
 #include <freertos/semphr.h>
 
 // EXT interrupt pin (PPM)
-#define GPIO_PPM_PIN  GPIO_NUM_34
+#define GPIO_PPM_PIN            GPIO_NUM_4
 
 // PWM Settings
 #define SERVO_LEFT_CHANNEL      LEDC_CHANNEL_0
@@ -29,14 +30,17 @@
 
 #define PWM_FREQUENCY           (50)
 
-#define SERVO_LEFT_PIN          GPIO_NUM_26
-#define SERVO_RIGHT_PIN         GPIO_NUM_27
+#define SERVO_LEFT_PIN          GPIO_NUM_32
+#define SERVO_RIGHT_PIN         GPIO_NUM_33
 
 const uint32_t SMIN = 1000;
 const uint32_t SMID = 1500;
 const uint32_t SMAX = 2000;
 
-SemaphoreHandle_t gMutex = NULL;
+constexpr int gGlideDeg = 0;
+constexpr int MIN_THRO_THRESHOLD = 100; // 10%
+
+SemaphoreHandle_t gMutex = nullptr;
 
 TaskHandle_t mainTaskHandle;
 QueueHandle_t gPPMQueue;
@@ -57,13 +61,24 @@ double map(double input, double in_sta, double in_end, double out_sta, double ou
     return clamp(out_sta + slope * (input - in_sta), out_end, out_sta);
 }
 
-struct sPPM {
+void setPWMs(const uint32_t duty1, const uint32_t duty2) {
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, SERVO_LEFT_CHANNEL, duty1);
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, SERVO_LEFT_CHANNEL);
+
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, SERVO_RIGHT_CHANNEL, duty2);
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, SERVO_RIGHT_CHANNEL);
+}
+
+struct PPM {
+    PPM() = default;
+    ~PPM() = default;
+
     uint32_t aileron()    { receive(); return clamp(aile, SMIN, SMAX) - SMID; }
     uint32_t elevator()   { receive(); return clamp(elev, SMIN, SMAX) - SMID; }
     uint32_t throttle()   { receive(); return clamp(thro, SMIN, SMAX) - SMIN; }
     uint32_t rudder()     { receive(); return clamp(rudd, SMIN, SMAX) - SMID; }
     uint32_t period()     { receive(); return map(clamp(ch5, SMIN, SMAX), SMIN, SMAX, 100, 300); }
-    uint32_t channel6()   { receive(); return clamp(ch6, SMIN, SMAX); }
+    uint32_t channel6()   { receive(); return clamp(ch6, SMIN, SMAX) - SMID; } // clamp between -100 and 100
 
     void receive() {
         if(xQueueReceive(gPPMQueue, this, 0) == pdTRUE) {
@@ -81,18 +96,84 @@ struct sPPM {
     uint32_t ch6;
 };
 
-class cFreeRTOS {
+class Bird {
 public:
-  cFreeRTOS(){}
-  ~cFreeRTOS(){}
-  static void startTask(void task(void *), std::string taskName, void *param=nullptr, int stackSize = 4096) {
-    xTaskCreate(task, taskName.data(), stackSize, param, 10, NULL);
-  }
+    enum class FlapState {
+        DOWNSTROKE,
+        UPSTROKE
+    };
+
+    Bird() {
+        // stackSize = 4096; priority = 10;
+        xTaskCreate(&Bird::mainTaskImpl, "mainTask", 4096, this, 10, nullptr); // pass this to the static task method as parameter!
+    }
+
+    ~Bird() = default;
+
+    void mainTask() {
+        uint32_t max_duty = (1 << LEDC_TIMER_13_BIT) - 1;
+
+        while(1) {
+
+            auto elapsed = 0;
+            auto prevTime = millis();
+            auto period = mRC.period();
+
+            while(elapsed < period) {
+
+                auto [ servo1Pos, servo2Pos ] = calculateServoPositions();
+
+                uint32_t servo1Duty = (servo1Pos * max_duty) / (1000000 / PWM_FREQUENCY);
+                uint32_t servo2Duty = (servo2Pos * max_duty) / (1000000 / PWM_FREQUENCY);
+
+                setPWMs(servo1Duty, servo2Duty);
+
+                vTaskDelay(period / 3 / portTICK_PERIOD_MS);
+
+                elapsed = millis() - prevTime;
+            }
+
+            nextState(); // advance to next state: UPSTROKE / DOWNSTROKE
+
+        } // while(1)
+    } // mainTask
+
+private:
+    static void mainTaskImpl(void* pvParams) {
+        auto* bird = static_cast<Bird*>(pvParams);
+        bird->mainTask();
+    }
+
+    void nextState() {
+        mState = static_cast<FlapState>((static_cast<int>(mState) + 1) % 2);
+    }
+
+    std::tuple<int, int> calculateServoPositions() {
+        int thro = mRC.throttle();
+        int aile = mRC.aileron();
+        int elev = mRC.elevator();
+        int rudd = mRC.rudder();
+        int offset = clamp(static_cast<int>(mRC.channel6()), -100, 100); // between -100 and 100
+
+        if(thro < MIN_THRO_THRESHOLD) {
+            return { static_cast<int>(SMID + aile - elev + gGlideDeg + offset), static_cast<int>(SMID + aile + elev - gGlideDeg + offset) };
+        } else {
+            if(mState == FlapState::UPSTROKE) {
+                return { static_cast<int>(thro / 2 + 1500 + aile - elev + rudd + offset), // add offset for both servos to have opposing effect
+                    static_cast<int>(1000 + (2000 - (thro / 2 + 1500)) + aile + elev + rudd + offset) }; // add offset for both servos to have opposing effect
+            } else { // DOWNSTROKE
+                return { static_cast<int>(1000 + (2000 - (thro / 2 + 1500)) + aile - elev - rudd + offset),
+                    static_cast<int>(thro / 2 + 1500 + aile + elev - rudd + offset) };
+            }
+        }
+    }
+
+private:
+    PPM mRC;
+    FlapState mState;
 };
 
-volatile struct sPPM ppm;
-
-void setup_gpio() {
+void setupGPIO() {
     gpio_config_t io_conf;
     // Configure the GPIO pin as input
     io_conf.intr_type = static_cast<gpio_int_type_t>(GPIO_PIN_INTR_ANYEDGE);
@@ -102,6 +183,8 @@ void setup_gpio() {
     io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
     gpio_config(&io_conf);
 }
+
+volatile PPM ppm;
 
 void IRAM_ATTR gpio_isr_handler(void* arg) {
 
@@ -118,13 +201,9 @@ void IRAM_ATTR gpio_isr_handler(void* arg) {
 
     if (counter < 510) { //must be a pulse
         pulse = counter;
-    }
-    else if (counter > 1910)
-    { //sync
+    } else if (counter > 1910) { //sync
         channel = 0;
-    }
-    else
-    { //servo values between 810 and 2210 will end up here
+    } else { //servo values between 810 and 2210 will end up here
         tmpVal = counter + pulse;
         if (tmpVal > 810 && tmpVal < 2210) {
             switch(channel) {
@@ -154,6 +233,10 @@ void IRAM_ATTR gpio_isr_handler(void* arg) {
     // copy ppm values to queue
     if(channel == 5) {
         BaseType_t pxHigherPriorityTaskWoken = pdFALSE;
+
+        // try this, but use queue with only one element capacity!
+        //xQueueOverwriteFromISR(gPPMQueue, &ppm, &pxHigherPriorityTaskWoken);
+
         xQueueSendFromISR(gPPMQueue, (void*)&ppm, &pxHigherPriorityTaskWoken);
         if (pxHigherPriorityTaskWoken == pdTRUE) {
             portYIELD_FROM_ISR();
@@ -161,7 +244,7 @@ void IRAM_ATTR gpio_isr_handler(void* arg) {
     }
 }
 
-void setup_interrupt() {
+void setupInterrupt() {
     // Install the GPIO ISR service
     gpio_install_isr_service(0);
 
@@ -169,7 +252,7 @@ void setup_interrupt() {
     gpio_isr_handler_add(GPIO_PPM_PIN, gpio_isr_handler, (void*)GPIO_PPM_PIN);
 }
 
-void setup_pwm() {
+void setupPWM() {
 
     ledc_timer_config_t ledc_timer;
     memset(&ledc_timer, 0, sizeof(ledc_timer));
@@ -201,89 +284,16 @@ void setup_pwm() {
     ledc_channel_config(&servo_right);
 }
 
-void setPWMs(const uint32_t duty1, const uint32_t duty2)
-{
-    ledc_set_duty(LEDC_HIGH_SPEED_MODE, SERVO_LEFT_CHANNEL, duty1);
-    ledc_update_duty(LEDC_HIGH_SPEED_MODE, SERVO_LEFT_CHANNEL);
-
-    ledc_set_duty(LEDC_HIGH_SPEED_MODE, SERVO_RIGHT_CHANNEL, duty2);
-    ledc_update_duty(LEDC_HIGH_SPEED_MODE, SERVO_RIGHT_CHANNEL);
-}
-
-void mainTask(void *pvParameter)
-{
-    struct sPPM rc;
-    int servo_comm1 = 0;
-    int servo_comm2 = 0;
-
-    uint32_t max_duty = (1 << LEDC_TIMER_13_BIT) - 1;
-    uint32_t duty_cycle1;
-    uint32_t duty_cycle2;
-
-    while (1) {
-
-        // UPSTROKE
-        auto elapsed = 0;
-        auto prevTime = millis();
-        auto period = rc.period();
-
-        while(elapsed < period) {
-
-            int thro = rc.throttle();
-            int aile = rc.aileron();
-            int elev = rc.elevator();
-            int rudd = rc.rudder();
-
-            servo_comm1 = (int)(thro / 2 + 1500 + aile - elev + rudd);
-            servo_comm2 = (int)(1000 + (2000 - (thro / 2 + 1500)) + aile + elev + rudd);
-
-            duty_cycle1 = (servo_comm1 * max_duty) / (1000000 / PWM_FREQUENCY);
-            duty_cycle2 = (servo_comm2 * max_duty) / (1000000 / PWM_FREQUENCY);
-
-            setPWMs(duty_cycle1, duty_cycle2);
-
-            vTaskDelay(period / 3 / portTICK_PERIOD_MS);
-
-            elapsed = millis() - prevTime;
-        }
-
-        // DOWNSTROKE
-        elapsed = 0;
-        prevTime = millis();
-        period = rc.period();
-        while(elapsed < period) {
-
-            int thro = rc.throttle();
-            int aile = rc.aileron();
-            int elev = rc.elevator();
-            int rudd = rc.rudder();
-
-            servo_comm1 = (int)(thro / 2 + 1500 + aile + elev - rudd);
-            servo_comm2 = (int)(1000 + (2000 - (thro / 2 + 1500)) + aile - elev - rudd);
-
-            duty_cycle1 = (servo_comm1 * max_duty) / (1000000 / PWM_FREQUENCY);
-            duty_cycle2 = (servo_comm2 * max_duty) / (1000000 / PWM_FREQUENCY);
-
-            setPWMs(duty_cycle2, duty_cycle1);
-
-            vTaskDelay(period / 3 / portTICK_PERIOD_MS);
-
-            elapsed = millis() - prevTime;
-        }
-    }
-}
-
-extern "C" void app_main(void)
-{
+extern "C" void app_main(void) {
     std::cout << "Flappin'" << std::endl;
 
     gMutex = xSemaphoreCreateMutex();
-    gPPMQueue = xQueueCreate(10, sizeof(struct sPPM));
+    gPPMQueue = xQueueCreate(10, sizeof(ppm));
 
-    setup_gpio();
-    setup_interrupt();
+    setupGPIO();
+    setupInterrupt();
 
-    setup_pwm();
+    setupPWM();
 
-    cFreeRTOS::startTask(mainTask, "mainTask");
+    Bird bird; // will run forever
 }
